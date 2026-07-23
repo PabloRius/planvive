@@ -1,0 +1,111 @@
+name: Daily Scraper & Dashboard Deployment
+
+# NOTA: este workflow asume que la carpeta src/planvive/ es la RAÍZ del repo de
+# GitHub (los comandos usan `python3 planvive.py`, `output/…`, `planvive.db`).
+# Si publicas el monorepo completo, mueve este fichero a la raíz y añade
+# `defaults: { run: { working-directory: src/planvive } }` al job.
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # Diario a las 03:00 UTC
+  workflow_dispatch:       # Permite lanzarlo a mano desde la UI
+
+concurrency:
+  group: daily-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write      # Releases (snapshots + BD) y push a gh-pages
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Inject proxy secret
+        run: printf '%s\n' "${{ secrets.PROXIES_TXT }}" > proxies.txt
+
+      - name: Restore state DB (SQLite) from db-latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # El histórico CDC vive en planvive.db, que se persiste como asset de un
+          # release rodante. En la primera ejecución aún no existe -> génesis.
+          if gh release download db-latest --pattern 'planvive.db.gz' --dir . 2>/dev/null; then
+            gunzip -f planvive.db.gz
+            echo "BD restaurada desde db-latest."
+          else
+            echo "No hay BD previa; se hará carga génesis."
+          fi
+
+      - name: Execute scraper
+        run: python3 planvive.py --proxy-file proxies.txt --rotating-gateway --workers 24 --per-proxy-interval 0.06
+
+      - name: Ingest snapshot into DB (CDC diff)
+        run: python3 ingest.py
+
+      - name: Generate dashboard HTML
+        run: python3 dashboard.py
+
+      - name: Stage Pages site (solo el HTML)
+        run: |
+          mkdir -p site
+          cp output/dashboard.html site/index.html
+          touch site/.nojekyll
+
+      - name: Compress snapshot for archiving
+        id: compress
+        run: |
+          TODAY=$(date +'%Y-%m-%d')
+          SNAPSHOT_PATH="output/snapshots/planvive_${TODAY}.csv"
+          GZ_PATH="output/snapshots/planvive_${TODAY}.csv.gz"
+          if [ -f "$SNAPSHOT_PATH" ]; then
+            gzip -kf "$SNAPSHOT_PATH"
+            echo "gz_path=$GZ_PATH" >> "$GITHUB_OUTPUT"
+            echo "today=$TODAY" >> "$GITHUB_OUTPUT"
+          else
+            echo "Error: snapshot no encontrado en $SNAPSHOT_PATH"
+            exit 1
+          fi
+
+      - name: Create historical release & upload snapshot asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: snapshot-${{ steps.compress.outputs.today }}
+          name: Snapshot ${{ steps.compress.outputs.today }}
+          body: |
+            Snapshot diario automático del ${{ steps.compress.outputs.today }}.
+            Adjunto `.csv.gz` con el listado completo (para archivo y reconstrucción de la BD).
+          files: ${{ steps.compress.outputs.gz_path }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Persist state DB back to db-latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gzip -kf planvive.db
+          gh release create db-latest --title "State DB (latest)" \
+            --notes "Estado CDC acumulado (SQLite). Se sobrescribe en cada ejecución." \
+            2>/dev/null || true
+          gh release upload db-latest planvive.db.gz --clobber
+
+      - name: Deploy dashboard to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          destination_dir: .
+          keep_files: false
