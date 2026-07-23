@@ -1,5 +1,14 @@
 # Credenciales de proxy — NO commitear
 proxies.txt
 
-# Datos de salida y checkpoints
+# Datos de salida y checkpoints (snapshots CSV, dashboard, stats)
 output/
+
+# Base de datos CDC local (se persiste como asset de release en CI)
+planvive.db
+planvive.db-wal
+planvive.db-shm
+*.gz
+
+# Directorio de publicación de Pages
+site/

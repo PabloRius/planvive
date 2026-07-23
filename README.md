@@ -197,16 +197,78 @@ El informe es grande porque la pestaña de datos en bruto incrusta el snapshot
 completo (~14 MB con 226 k filas). Para compartir algo más ligero usa `--no-raw`
 o `--max-raw`.
 
+## Historial de cambios (CDC) y base de datos
+
+El listado es un snapshot del **estado actual**: cada `id` aparece una sola vez,
+con su último estado. No se puede ver cómo evolucionó una solicitud desde un solo
+CSV. Para reconstruir la historia (y medir *cuánto tarda* en resolverse una
+solicitud) hay que **diffear snapshots diarios** y guardar solo los cambios.
+
+`ingest.py` hace ese *change-data-capture* sobre una BD **SQLite** (`planvive.db`,
+librería estándar):
+
+```bash
+python3 ingest.py            # ingiere snapshots nuevos de output/snapshots/
+python3 ingest.py --stats    # resumen de la BD
+```
+
+Compara el snapshot del día contra el estado guardado y registra **altas**
+(`created`), **cambios de estado/prioridad**, **bajas** (`disappeared`) y
+**reapariciones**. Materializa `current_state` (estado vigente) y la dimensión
+`solicitud` (con `submitted_at` = creación real, `first_seen`/`last_seen`).
+Guardar deltas en vez de copias completas mantiene la BD compacta (la primera
+carga *génesis* es ~68 MB; cada día siguiente solo añade los cambios).
+
+Tablas: `solicitud`, `current_state`, `event` (log de cambios), `scrape_run`
+(metadatos + contadores por día). Con esto se derivan, **agregadas por
+municipio**: tiempos de resolución, matriz de transiciones, tasa de conversión y
+flujo diario (altas/cambios/bajas).
+
+> **Avisos.** (1) *Resolución diaria*: un cambio ocurrió entre dos scrapes (±1
+> día). (2) *Censura por la izquierda*: los 226 k ya existentes el primer día
+> entran como línea base sin historia previa; las duraciones **precisas** solo
+> salen de transiciones observadas en directo. Por eso conviene **arrancar el
+> ingester cuanto antes** — cada día sin diffear es historia que se pierde.
+
 ## Flujo diario
 
-`run_daily.sh` encadena scrape + dashboard:
+`run_daily.sh` encadena scrape → ingesta CDC → dashboard:
 
 ```bash
 ./run_daily.sh
 ```
 
-Ideal para un `cron` diario. Cada ejecución guarda el snapshot del día (datos y
-estados más recientes) y regenera `output/dashboard.html` a partir del último —
-sin cargar nada a mano. Los snapshots diarios se conservan: no hacen falta para
-las tendencias (que salen del `timestamp` de cada solicitud), pero son la única
-forma de reconstruir en el futuro la **historia real de cambios de estado**.
+Ideal para un `cron` diario. Cada ejecución guarda el snapshot del día, actualiza
+`planvive.db` con los cambios y regenera `output/dashboard.html` — sin cargar nada
+a mano.
+
+## Producción: GitHub Actions + Pages + Releases
+
+`.github/workflows/daily_pipeline.yml` automatiza todo a coste cero (cron 03:00
+UTC, o disparo manual). En cada ejecución:
+
+1. **Restaura** `planvive.db` desde el asset del release rodante `db-latest`
+   (los runners son efímeros; así el histórico persiste).
+2. **Scrapea** el snapshot del día (proxies desde el secret `PROXIES_TXT`).
+3. **Ingiere** los cambios en la BD (`ingest.py`).
+4. **Genera** el dashboard y lo publica en **GitHub Pages** (solo el HTML).
+5. **Archiva** el snapshot comprimido `planvive_<fecha>.csv.gz` como asset de un
+   release `snapshot-<fecha>` (archivo histórico, permite reconstruir la BD).
+6. **Persiste** `planvive.db.gz` de vuelta en `db-latest` (`gh release upload
+   --clobber`).
+
+Requisitos:
+
+- El workflow asume que **`src/planvive/` es la raíz del repo** de GitHub (usa
+  `python3 planvive.py`). Si publicas el monorepo, mueve el fichero a la raíz y
+  añade `working-directory: src/planvive`.
+- Secret **`PROXIES_TXT`** con el contenido de `proxies.txt` (Settings → Secrets
+  → Actions). El `GITHUB_TOKEN` estándar basta para releases y Pages.
+- Activa **Pages** en modo *Deploy from a branch → `gh-pages`*.
+- Los snapshots CSV y `planvive.db` **no** se commitean (van a releases); ver
+  `.gitignore`.
+
+> Ojo: publicar en Pages sirve el listado completo (anonimizado, ya público en la
+> web oficial). Si prefieres una página pública más ligera, cambia el paso de
+> dashboard a `python3 dashboard.py --no-raw` (informe de ~40 KB sin la tabla en
+> bruto).
