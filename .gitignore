@@ -1,0 +1,5 @@
+# Credenciales de proxy — NO commitear
+proxies.txt
+
+# Datos de salida y checkpoints
+output/
