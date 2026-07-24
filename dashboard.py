@@ -36,6 +36,8 @@ import argparse
 import csv
 import json
 import re
+import sqlite3
+import statistics
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -171,6 +173,101 @@ def build_data(csv_path: Path, include_raw: bool, max_raw: int | None) -> dict:
     }
 
 
+def _pctile(vals: list[float], p: float) -> float:
+    if not vals:
+        return 0.0
+    k = (len(vals) - 1) * p / 100.0
+    f = int(k)
+    c = min(f + 1, len(vals) - 1)
+    return vals[f] + (vals[c] - vals[f]) * (k - f)
+
+
+def build_hist(db_path: Path, data: dict) -> dict | None:
+    """Lee planvive.db (CDC) y calcula los agregados del histórico para el informe.
+
+    Todo se indexa contra los diccionarios de `data` (lotes/estados/municipios) para
+    que el JS pueda mapear. Devuelve None si no hay BD.
+    """
+    if not db_path.exists():
+        return None
+    li = {l: i for i, l in enumerate(data["lotes"])}
+    ei = {e: i for i, e in enumerate(data["estados"])}
+    mi = {m: i for i, m in enumerate(data["municipios"])}
+    conn = sqlite3.connect(str(db_path))
+    n_events = conn.execute("SELECT COUNT(*) FROM event").fetchone()[0]
+    scrape_dates = [r[0] for r in conn.execute("SELECT scrape_date FROM scrape_run ORDER BY scrape_date")]
+
+    # --- Flujo: eventos por (fecha, lote, municipio) -> [altas, cambios, bajas, reap] ---
+    KIND = {"created": 0, "status": 1, "disappeared": 2, "reappeared": 3}
+    flow_agg: dict = defaultdict(lambda: [0, 0, 0, 0])
+    for sdate, lote, muni, kind in conn.execute(
+            "SELECT e.scrape_date, s.lote, s.municipality, e.kind "
+            "FROM event e JOIN solicitud s ON s.id=e.id"):
+        k = KIND.get(kind)
+        if k is None or lote not in li or muni not in mi:
+            continue
+        flow_agg[(sdate, lote, muni)][k] += 1
+    flow_dates = sorted({d for (d, _l, _m) in flow_agg})
+    fdi = {d: i for i, d in enumerate(flow_dates)}
+    flow = [[fdi[d], li[l], mi[m], *v] for (d, l, m), v in flow_agg.items()]
+
+    # --- Matriz de transiciones (todo el histórico) por (lote, muni, from, to) ---
+    trans_agg: dict = defaultdict(int)
+    for lote, muni, ps, st in conn.execute(
+            "SELECT s.lote, s.municipality, e.prev_status, e.status "
+            "FROM event e JOIN solicitud s ON s.id=e.id WHERE e.kind='status'"):
+        if ps in ei and st in ei and lote in li and muni in mi:
+            trans_agg[(lote, muni, ps, st)] += 1
+    transitions = [[li[l], mi[m], ei[ps], ei[st], c] for (l, m, ps, st), c in trans_agg.items()]
+
+    # --- Tiempos: edad (días desde la creación) al alcanzar cada estado, por (lote,muni,to) ---
+    dur_agg: dict = defaultdict(list)
+    for lote, muni, status, sdate, subm in conn.execute(
+            "SELECT s.lote, s.municipality, e.status, e.scrape_date, s.submitted_at "
+            "FROM event e JOIN solicitud s ON s.id=e.id WHERE e.kind='status'"):
+        if status not in ei or lote not in li or muni not in mi:
+            continue
+        try:
+            d0 = datetime.fromisoformat(subm.replace("Z", "+00:00")).date()
+            d1 = datetime.fromisoformat(sdate).date()
+            days = (d1 - d0).days
+        except (ValueError, AttributeError):
+            continue
+        if days >= 0:
+            dur_agg[(lote, muni, status)].append(days)
+    durations = []
+    for (l, m, st), vals in dur_agg.items():
+        vals.sort()
+        durations.append([li[l], mi[m], ei[st], len(vals),
+                          round(statistics.mean(vals), 1), round(statistics.median(vals), 1),
+                          round(_pctile(vals, 25), 1), round(_pctile(vals, 75), 1)])
+
+    # --- Cohorte de conversión: por (lote, muni, mes de solicitud) -> conteo por estado (vigente) ---
+    cohort_agg: dict = defaultdict(lambda: [0] * len(data["estados"]))
+    for lote, muni, month, status in conn.execute(
+            "SELECT s.lote, s.municipality, substr(s.submitted_at,1,7), cs.status "
+            "FROM solicitud s JOIN current_state cs ON cs.id=s.id WHERE cs.present=1"):
+        if status not in ei or lote not in li or muni not in mi or not month or len(month) != 7:
+            continue
+        cohort_agg[(lote, muni, month)][ei[status]] += 1
+    cohort_months = sorted({mo for (_l, _m, mo) in cohort_agg})
+    cmi = {mo: i for i, mo in enumerate(cohort_months)}
+    cohort = [[li[l], mi[m], cmi[mo], *counts] for (l, m, mo), counts in cohort_agg.items()]
+
+    conn.close()
+    return {
+        "n_events": n_events,
+        "has_events": n_events > 0,
+        "scrape_dates": scrape_dates,
+        "flow_dates": flow_dates,
+        "flow": flow,
+        "transitions": transitions,
+        "durations": durations,
+        "cohort_months": cohort_months,
+        "cohort": cohort,
+    }
+
+
 def render_html(data: dict) -> str:
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return HTML_HEAD + "<script>window.DATA=" + payload + ";</script>\n" + HTML_BODY
@@ -189,6 +286,8 @@ def main() -> None:
     p.add_argument("--snapshots-dir", type=Path, default=module_dir / "output" / "snapshots")
     p.add_argument("--csv", type=Path, default=None, help="CSV concreto (por defecto, el último snapshot).")
     p.add_argument("--out", type=Path, default=module_dir / "output" / "dashboard.html")
+    p.add_argument("--db", type=Path, default=module_dir / "planvive.db",
+                   help="BD SQLite del histórico (CDC). Si no existe, la pestaña Evolución queda vacía.")
     p.add_argument("--no-raw", action="store_true", help="No incrustar la tabla en bruto (informe ligero).")
     p.add_argument("--max-raw", type=int, default=None, help="Limitar filas de la tabla en bruto.")
     args = p.parse_args()
@@ -196,6 +295,10 @@ def main() -> None:
     csv_path = args.csv or latest_csv(args.snapshots_dir)
     print(f"Generando informe desde {csv_path} …", file=sys.stderr)
     data = build_data(csv_path, include_raw=not args.no_raw, max_raw=args.max_raw)
+    data["hist"] = build_hist(args.db, data)
+    if data["hist"]:
+        print(f"  histórico: {data['hist']['n_events']:,} eventos · "
+              f"{len(data['hist']['scrape_dates'])} scrapes", file=sys.stderr)
     html = render_html(data)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(html, encoding="utf-8")
@@ -333,6 +436,7 @@ HTML_BODY = r"""
   <div class="tabs" role="tablist">
     <button class="tab" role="tab" data-tab="resumen" aria-selected="true">Resumen</button>
     <button class="tab" role="tab" data-tab="agregacion" aria-selected="false">Agregación</button>
+    <button class="tab" role="tab" data-tab="evolucion" aria-selected="false">Evolución</button>
     <button class="tab" role="tab" data-tab="bruto" aria-selected="false">Datos en bruto</button>
   </div>
 
@@ -362,6 +466,7 @@ HTML_BODY = r"""
 
   <section id="tab-resumen"></section>
   <section id="tab-agregacion" hidden></section>
+  <section id="tab-evolucion" hidden></section>
   <section id="tab-bruto" hidden></section>
 </div>
 
@@ -496,14 +601,15 @@ function stackedColumns(host, cats, xs, opts){
 
 function hbars(host, items, opts){
   opts=opts||{}; const rowH=30, W=host.clientWidth||520, H=Math.max(1,items.length)*rowH+8;
-  const mL=opts.labelW||140, mR=54, pw=W-mL-mR; const maxV=Math.max(1,...items.map(d=>d.val));
+  const mL=opts.labelW||140, mR=opts.mR||54, pw=W-mL-mR; const fmtV=opts.fmtVal||fmt;
+  const maxV=opts.max||Math.max(1,...items.map(d=>d.val));
   const svg=el('svg',{viewBox:`0 0 ${W} ${H}`,role:'img'});
-  items.forEach((d,i)=>{ const y=i*rowH+4, bw=pw*d.val/maxV, barH=Math.min(20,rowH-10);
+  items.forEach((d,i)=>{ const y=i*rowH+4, bw=pw*Math.min(d.val,maxV)/maxV, barH=Math.min(20,rowH-10);
     const lab=el('text',{x:mL-10,y:y+rowH/2,'text-anchor':'end','dominant-baseline':'middle',class:'axis-txt',fill:'var(--ink-2)'}); lab.textContent=d.name; svg.appendChild(lab);
     svg.appendChild(el('rect',{x:mL,y:y+(rowH-barH)/2,width:Math.max(2,bw),height:barH,rx:4,fill:d.color||'var(--seq)'}));
-    const val=el('text',{x:mL+Math.max(2,bw)+7,y:y+rowH/2,'dominant-baseline':'middle',class:'axis-txt',fill:'var(--ink-2)'}); val.textContent=fmt(d.val); svg.appendChild(val);
+    const val=el('text',{x:mL+Math.max(2,bw)+7,y:y+rowH/2,'dominant-baseline':'middle',class:'axis-txt',fill:'var(--ink-2)'}); val.textContent=fmtV(d.val); svg.appendChild(val);
     const hit=el('rect',{x:0,y,width:W,height:rowH,fill:'transparent'});
-    hit.addEventListener('pointermove',ev=> showTT(ttNode(d.name,[{name:opts.unit||'Solicitudes',color:d.color,val:fmt(d.val)}]),ev.clientX,ev.clientY));
+    hit.addEventListener('pointermove',ev=> showTT(ttNode(d.name, d.tip||[{name:opts.unit||'Solicitudes',color:d.color,val:fmtV(d.val)}]),ev.clientX,ev.clientY));
     hit.addEventListener('pointerleave',hideTT); svg.appendChild(hit); });
   host.innerHTML=''; host.appendChild(svg);
 }
@@ -699,6 +805,114 @@ function muniDetalle(mrows){
   sel.onchange=draw; requestAnimationFrame(draw); return card;
 }
 
+/* ----------------------------- Evolución (histórico CDC) ----------------------------- */
+function noteEl(t){ const p=document.createElement('p'); p.className='note'; p.textContent=t; return p; }
+function h3el(t){ const h=document.createElement('h3'); h.textContent=t; return h; }
+function csubel(t){ const d=document.createElement('div'); d.className='csub'; d.textContent=t; return d; }
+function fmtDayShort(d){ const dt=new Date(d+'T00:00:00'); return isNaN(dt)?d:dt.toLocaleDateString('es-ES',{day:'2-digit',month:'short'}); }
+function fmtMonth(mo){ const dt=new Date(mo+'-01T00:00:00'); return isNaN(dt)?mo:dt.toLocaleDateString('es-ES',{month:'short',year:'2-digit'}); }
+const HIST_LSET = ()=> new Set(selLotes().map(l=>DATA.lotes.indexOf(l)));
+function monthInRange(mo){ if(S.range==='all'||!NDAYS) return true;
+  const cut=new Date(DAYS[NDAYS-1]+'T00:00:00'); cut.setDate(cut.getDate()-(+S.range)); return mo >= cut.toISOString().slice(0,7); }
+
+function renderEvolucion(){
+  const host=document.getElementById('tab-evolucion'); host.innerHTML='';
+  const H=DATA.hist;
+  if(!H){ host.appendChild(noteEl('No hay base de datos de histórico (planvive.db). Ejecuta ingest.py.')); return; }
+  const intro=document.createElement('p'); intro.className='csub';
+  intro.textContent = H.has_events
+    ? (fmt(H.n_events)+' eventos observados en '+H.scrape_dates.length+' scrape(s), del '+fmtDayLong(H.scrape_dates[0])+' al '+fmtDayLong(H.scrape_dates[H.scrape_dates.length-1]))
+    : 'Aún no hay eventos de cambio: el histórico se construye diffeando snapshots diarios. Tras el próximo scrape se poblarán flujo, transiciones y tiempos. La tasa de conversión ya usa el estado actual.';
+  host.appendChild(intro);
+  host.appendChild(conversionMuniCard());
+  host.appendChild(conversionCohortCard());
+  host.appendChild(flowCard());
+  host.appendChild(transitionsCard());
+  host.appendChild(durationsCard());
+}
+
+function conversionAgg(){
+  const H=DATA.hist, firm=DATA.estados.indexOf('Contrato firmado'), lset=HIST_LSET();
+  const perMuni={}, perMonth={};
+  for(const row of H.cohort){ const li=row[0], mIdx=row[1], cmIdx=row[2]; if(!lset.has(li)) continue;
+    const counts=row.slice(3); const total=counts.reduce((a,b)=>a+b,0); const f=firm>=0?(counts[firm]||0):0;
+    const mn=DATA.municipios[mIdx]; (perMuni[mn]=perMuni[mn]||{total:0,firmado:0}); perMuni[mn].total+=total; perMuni[mn].firmado+=f;
+    const mo=H.cohort_months[cmIdx]; (perMonth[mo]=perMonth[mo]||{total:0,firmado:0}); perMonth[mo].total+=total; perMonth[mo].firmado+=f; }
+  return {perMuni, perMonth};
+}
+function conversionMuniCard(){
+  return chartCard('Tasa de conversión a contrato firmado por municipio','% de solicitudes que están hoy en «Contrato firmado»',
+    (h)=>{ const {perMuni}=conversionAgg();
+      const items=Object.entries(perMuni).map(([m,o])=>({name:m, val:o.total?100*o.firmado/o.total:0, color:'var(--good-mark)',
+        tip:[{name:'Firmados',color:'var(--good-mark)',val:fmt(o.firmado)},{name:'Total',val:fmt(o.total)},{name:'Tasa',val:fmtPct(o.total?100*o.firmado/o.total:0)}]}))
+        .filter(d=>d.val>=0).sort((a,b)=>b.val-a.val);
+      if(!items.length){ h.appendChild(noteEl('Sin datos.')); return; }
+      hbars(h,items,{labelW:170, max:Math.max(1,...items.map(d=>d.val)), fmtVal:v=>fmtPct(v), mR:72}); }, null, true);
+}
+function conversionCohortCard(){
+  return chartCard('Conversión por cohorte (mes de solicitud)','% firmado según el mes en que se presentó la solicitud',
+    (h)=>{ const {perMonth}=conversionAgg(); const months=Object.keys(perMonth).sort().filter(monthInRange);
+      if(!months.length){ h.appendChild(noteEl('Sin datos en el periodo seleccionado.')); return; }
+      const xs=months.map(mo=>({label:fmtMonth(mo),full:fmtMonth(mo)}));
+      const vals=months.map(mo=> perMonth[mo].total? 100*perMonth[mo].firmado/perMonth[mo].total : 0);
+      lineChart(h,[{name:'% firmado',color:'var(--good-mark)',vals}],xs,{h:220}); }, null, true);
+}
+
+function flowCard(){
+  return chartCard('Flujo de eventos','Altas, cambios de estado y bajas observados entre scrapes',
+    (h)=>{ const H=DATA.hist; if(!H.flow.length){ h.appendChild(noteEl('Aún sin eventos — aparecerán tras el primer diff (mañana).')); return; }
+      const lset=HIST_LSET(); const per=H.flow_dates.map(()=>[0,0,0]);
+      for(const r of H.flow){ if(!lset.has(r[1])) continue; per[r[0]][0]+=r[3]; per[r[0]][1]+=r[4]; per[r[0]][2]+=r[5]; }
+      const xs=H.flow_dates.map(d=>({label:fmtDayShort(d),full:fmtDayLong(d)}));
+      const cats=[{name:'Altas',color:'var(--s3)',vals:per.map(v=>v[0])},
+                  {name:'Cambios de estado',color:'var(--s1)',vals:per.map(v=>v[1])},
+                  {name:'Bajas',color:'var(--s2)',vals:per.map(v=>v[2])}];
+      stackedColumns(h,cats,xs,{h:230}); },
+    legendItems([{name:'Altas',color:'var(--s3)'},{name:'Cambios de estado',color:'var(--s1)'},{name:'Bajas',color:'var(--s2)'}]), true);
+}
+
+function transitionsCard(){
+  const H=DATA.hist; const card=document.createElement('div'); card.className='card full';
+  card.appendChild(h3el('Matriz de transiciones de estado'));
+  card.appendChild(csubel('Cambios observados: fila = estado anterior → columna = nuevo estado (todo el histórico)'));
+  const lset=HIST_LSET(); const M={}; let maxc=0;
+  for(const [li,mi,fi,ti,c] of H.transitions){ if(!lset.has(li)) continue; const k=fi+'_'+ti; M[k]=(M[k]||0)+c; if(M[k]>maxc)maxc=M[k]; }
+  if(!maxc){ card.appendChild(noteEl('Aún sin transiciones — aparecerán tras el primer diff (mañana).')); return card; }
+  const wrap=document.createElement('div'); wrap.className='tablewrap'; wrap.style.maxHeight='none';
+  const t=document.createElement('table'); const thead=document.createElement('thead'); const hr=document.createElement('tr');
+  hr.appendChild(Object.assign(document.createElement('th'),{textContent:'De \\ A'}));
+  DATA.estados.forEach(e=>{ const th=document.createElement('th'); th.className='num'; th.textContent=e; hr.appendChild(th); });
+  thead.appendChild(hr); t.appendChild(thead); const tb=document.createElement('tbody');
+  DATA.estados.forEach((ef,fi)=>{ const tr=document.createElement('tr'); const td0=document.createElement('td');
+    const dot=document.createElement('i'); dot.style.cssText='display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:7px;background:'+ESTADO_COLORS[ef];
+    td0.appendChild(dot); td0.appendChild(document.createTextNode(ef)); tr.appendChild(td0);
+    DATA.estados.forEach((et,ti)=>{ const c=M[fi+'_'+ti]||0; const td=document.createElement('td'); td.className='num';
+      if(c>0){ td.textContent=fmt(c); td.style.background='color-mix(in srgb, var(--seq) '+Math.round(12+68*c/maxc)+'%, transparent)'; }
+      else td.textContent='·'; tr.appendChild(td); });
+    tb.appendChild(tr); });
+  t.appendChild(tb); wrap.appendChild(t); card.appendChild(wrap); return card;
+}
+
+function durationsCard(){
+  const H=DATA.hist; const card=document.createElement('div'); card.className='card full';
+  card.appendChild(h3el('Tiempo hasta alcanzar cada estado'));
+  card.appendChild(csubel('Mediana de días desde la solicitud hasta observar el cambio, por municipio (solo transiciones observadas)'));
+  const lset=HIST_LSET(); const map={};
+  for(const [li,mi,ti,n,mean,median] of H.durations){ if(!lset.has(li)) continue; const mn=DATA.municipios[mi]; (map[mn]=map[mn]||{})[ti]={median,n}; }
+  const munis=Object.keys(map).sort();
+  if(!munis.length){ card.appendChild(noteEl('Aún sin tiempos — se calculan de transiciones observadas (tras el primer diff).')); return card; }
+  const wrap=document.createElement('div'); wrap.className='tablewrap';
+  const t=document.createElement('table'); const thead=document.createElement('thead'); const hr=document.createElement('tr');
+  hr.appendChild(Object.assign(document.createElement('th'),{textContent:'Municipio'}));
+  DATA.estados.forEach(e=>{ const th=document.createElement('th'); th.className='num'; th.textContent=e; hr.appendChild(th); });
+  thead.appendChild(hr); t.appendChild(thead); const tb=document.createElement('tbody');
+  munis.forEach(mn=>{ const tr=document.createElement('tr'); tr.appendChild(Object.assign(document.createElement('td'),{textContent:mn}));
+    DATA.estados.forEach((e,ti)=>{ const cell=map[mn][ti]; const td=document.createElement('td'); td.className='num';
+      if(cell){ td.textContent=fmt(cell.median)+' d'; td.title=cell.n+' transiciones'; } else td.textContent='·'; tr.appendChild(td); });
+    tb.appendChild(tr); });
+  t.appendChild(tb); wrap.appendChild(t); card.appendChild(wrap); return card;
+}
+
 /* ----------------------------- Datos en bruto ----------------------------- */
 function renderBruto(){
   const host=document.getElementById('tab-bruto'); host.innerHTML='';
@@ -759,9 +973,11 @@ function fieldSelect(label,opts){ const field=document.createElement('div'); fie
 /* ------------------------------ chrome ------------------------------ */
 function download(blob,name){ const u=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=u; a.download=name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(u),1500); }
 function setTab(tab){ S.tab=tab; document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected', b.dataset.tab===tab));
-  document.getElementById('tab-resumen').hidden=tab!=='resumen'; document.getElementById('tab-agregacion').hidden=tab!=='agregacion'; document.getElementById('tab-bruto').hidden=tab!=='bruto';
+  document.getElementById('tab-resumen').hidden=tab!=='resumen'; document.getElementById('tab-agregacion').hidden=tab!=='agregacion';
+  document.getElementById('tab-evolucion').hidden=tab!=='evolucion'; document.getElementById('tab-bruto').hidden=tab!=='bruto';
   document.getElementById('gran-field').style.display=tab==='resumen'?'':'none'; render(); }
-function render(){ if(S.tab==='resumen') renderResumen(); else if(S.tab==='agregacion') renderAgregacion(); else renderBruto(); }
+function render(){ if(S.tab==='resumen') renderResumen(); else if(S.tab==='agregacion') renderAgregacion();
+  else if(S.tab==='evolucion') renderEvolucion(); else renderBruto(); }
 function initFilters(){ const fl=document.getElementById('f-lote'); DATA.lotes.forEach(l=>{ const o=document.createElement('option'); o.value=l; o.textContent=l; fl.appendChild(o); });
   fl.onchange=()=>{ S.lote=fl.value; S.rawPage=1; render(); };
   document.getElementById('f-range').onchange=e=>{ S.range=e.target.value; S.rawPage=1; render(); };

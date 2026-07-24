@@ -182,6 +182,13 @@ Tres pestañas:
   **municipio × estado** ordenable por cualquier columna (p. ej. por «Contrato
   firmado»), y un **detalle por municipio** con su evolución de estados por periodo
   de solicitud. Además, distribuciones globales por estado y por prioridad.
+- **Evolución (histórico CDC, lee `planvive.db`)** — métricas que solo existen al
+  diffear snapshots: **tasa de conversión** a contrato firmado por municipio y por
+  cohorte de mes (disponible ya), **flujo de eventos** (altas/cambios/bajas por
+  día), **matriz de transiciones** estado→estado, y **tiempos** hasta cada estado
+  por municipio. Las tres últimas se pueblan tras el primer diff (aparecen con un
+  aviso hasta que hay historial); todas se agregan por municipio y respetan el
+  filtro de lote.
 - **Datos en bruto** — la instantánea completa como la web oficial pero más limpia:
   ordenable por cualquier columna (por defecto por fecha), filtrable (lote,
   municipio, estado, prioridad, búsqueda por código) y con **exportación a CSV**
